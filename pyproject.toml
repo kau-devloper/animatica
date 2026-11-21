@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "animatica"
+version = "0.2.0"
+description = "Prompt-to-explainer-video CLI built on Manim"
+requires-python = ">=3.10"
+dependencies = [
+  "manim==0.22.1",
+  "pydantic>=2.5",
+  "typer>=0.12",
+  "httpx>=0.27",
+  "platformdirs>=4",
+  "imageio-ffmpeg>=0.4",
+  "tomli>=2; python_version < '3.11'",
+  # Direct imports in animatica.frame_lint (transitive via manim, declared
+  # explicitly for clarity):
+  "av>=10.0.0",
+  "numpy>=1.24",
+  # MCP server (animatica mcp command):
+  "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=0.86.0"]
+# pytest-xdist runs the suite on several cores: the render tests dominate the
+# run time and each one is a subprocess, so they scale well.
+dev = ["pytest>=8", "pytest-asyncio>=1.0", "pytest-xdist>=3.6", "ruff>=0.6"]
+
+[project.scripts]
+animatica = "animatica.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+animatica = ["ai/providers.toml", "docs/*.md", "backends/hyperframes/template.html", "backends/hyperframes/fonts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "render: needs Manim and LaTeX; skipped when they are missing",
+    "tui: needs the optional textual package",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # Any warning is a failure; the one exception is pydub (a manim dependency)
+    # still importing the audioop module, which we cannot fix upstream.
+    "error",
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
+
+
+[tool.ruff]
+target-version = "py310"
+# The HyperFrames pilots are self-contained experiments with their own tests.
+extend-exclude = ["experiments", ".animatica-runtime", ".tex"]
+
+[tool.ruff.lint]
+# Real defects only: undefined names, unused imports/variables, redefinitions,
+# syntax errors. Style rules are deliberately not enforced.
+select = ["F", "E9"]

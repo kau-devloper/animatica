@@ -1,0 +1,625 @@
+"""``animatica make`` pipeline: prompt -> storyboard -> render -> captions -> report."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from animatica.ai.router import get_provider
+from animatica.ai.template import TemplateMatcher
+from animatica.ai.repair import generate_storyboard, generate_storyboard_two_stage
+from animatica.ai.guidance import check_generation_guidance
+from animatica.backends.base import RenderBackend, RenderOptions
+from animatica.backends import default_backends
+from animatica.components.registry import ComponentRegistry, default_registry
+from animatica.config import load_config
+from animatica.encode.probe import pick_encoder, probe_encoders
+from animatica.encode.transcode import transcode
+from animatica.paths import long_path
+from animatica.progress import ProgressFn, ProgressTracker
+from animatica.report import write_report
+from animatica.storyboard.cache import StoryboardCache
+from animatica.storyboard.lint import lint_storyboard
+from animatica.storyboard.models import Storyboard, dump_storyboard, load_storyboard
+
+# Frame lint is a non-fatal post-render quality check. Imported here so the
+# pipeline can wire it into ``make_video`` without the CLI knowing about PyAV.
+from animatica.frame_lint import FrameLintConfig, lint_video, lint_result_to_warnings  # noqa: PLC0415
+
+
+@dataclass
+class MakeResult:
+    video: Path
+    storyboard: Path
+    captions: Path
+    report: Path
+    warnings: list[str]
+    provider_used: str = ""
+    encoder_used: str = ""
+    fallbacks: list[str] = field(default_factory=list)
+
+
+def _vtt_timestamp(seconds: float) -> str:
+    total = int(round(seconds * 1000))
+    h = total // 3_600_000
+    total %= 3_600_000
+    m = total // 60_000
+    total %= 60_000
+    s = total // 1000
+    ms = total % 1000
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def _beat_durations(
+    sb: Storyboard, registry, narration_durations: list[list[float]] | None = None
+) -> list[list[float]]:
+    """How long each beat of each scene runs, in the storyboard's order.
+
+    The frame lint judges a beat as a whole: a beat that fades in must not
+    be condemned by its first frame, and a beat that never showed anything
+    must still be reported.
+
+    ``narration_durations``, when given, is a per-beat floor in the same
+    nested shape (see ``narration.narrate_storyboard``): each beat's duration
+    becomes ``max(visual, narration)``, holding the component's resting frame
+    for the difference rather than speeding up either side (spec section 3).
+    A scene or beat with no corresponding entry -- narration wasn't
+    synthesized for it, or the list is simply shorter -- keeps its visual
+    duration unchanged. With ``narration_durations=None`` (the default, no
+    ``--narrate``) this is exactly what it always was.
+    """
+    out: list[list[float]] = []
+    for s_idx, scene in enumerate(sb.scenes):
+        durations: list[float] = []
+        scene_narration = narration_durations[s_idx] if narration_durations and s_idx < len(narration_durations) else []
+        for b_idx, beat in enumerate(scene.beats):
+            try:
+                comp = registry.get(beat.component)
+                duration = comp.duration(comp.Params.model_validate(beat.params))
+            except Exception:  # pragma: no cover - the storyboard is validated earlier
+                duration = 0.0
+            if b_idx < len(scene_narration):
+                duration = max(duration, scene_narration[b_idx])
+            durations.append(duration)
+        out.append(durations)
+    return out
+
+
+def _caption_strip(sb: Storyboard, vertical: bool) -> float:
+    """The fraction of the frame the burned-in captions cover at the bottom.
+
+    The caption is not content: it sits in the bottom strip of every frame
+    and would otherwise make an empty beat look like it had something on
+    screen. How tall that strip is depends on how the caption's text wraps,
+    so it is measured with the caption the renderer will burn in rather than
+    guessed with a constant.
+    """
+    from manim import config
+
+    from animatica.components._draw import caption_strip_fraction, make_caption, pick_font
+    from animatica.components.theme import get_colors
+
+    colors = get_colors(sb.theme)
+    font = pick_font()
+    if font:
+        from manim import MarkupText, Text
+
+        Text.set_default(font=font)
+        MarkupText.set_default(font=font)
+
+    old_width = config.frame_width
+    try:
+        # A vertical render is a narrow frame: the caption wraps differently.
+        if vertical:
+            config.frame_width = 8.0 * 9 / 16
+        widest = 0.0
+        for scene in sb.scenes:
+            for beat in scene.beats:
+                text = (beat.caption or "").strip()
+                if not text:
+                    continue
+                caption = make_caption(text, colors)
+                widest = max(widest, caption_strip_fraction(caption, config.frame_height))
+        return widest
+    finally:
+        config.frame_width = old_width
+
+
+def beat_text(beat, comp, params=None) -> str:
+    """The text a beat is captioned (and, with ``--narrate``, narrated) with.
+
+    One lookup shared by ``_write_captions`` and ``narration.narrate_storyboard``
+    so the burned-in caption and the spoken narration can never drift apart:
+    narration reads the caption, it doesn't get its own script.
+    """
+    if params is None:
+        params = comp.Params.model_validate(beat.params)
+    return beat.caption or comp.fallback_text(params)
+
+
+def spoken_text(beat, comp, params=None) -> str:
+    """What ``--narrate`` says for a beat: its own ``narration``, else the caption text.
+
+    The burned-in caption and ``captions.vtt`` keep using ``beat_text`` -- a narration
+    script is allowed to differ from what is on screen, the caption is not.
+    """
+    return beat.narration.strip() or beat_text(beat, comp, params)
+
+
+def _write_captions(sb: Storyboard, registry, path: Path, beat_durations: list[list[float]] | None = None) -> None:
+    """``beat_durations`` (``--narrate``) overrides the visual durations so cues follow the extended beats."""
+    lines = ["WEBVTT", ""]
+    t = 0.0
+    for s_idx, scene in enumerate(sb.scenes):
+        for b_idx, beat in enumerate(scene.beats):
+            comp = registry.get(beat.component)
+            params = comp.Params.model_validate(beat.params)
+            dur = beat_durations[s_idx][b_idx] if beat_durations else comp.duration(params)
+            start, end = t, t + dur
+            t = end
+            text = beat_text(beat, comp, params)
+            lines.append(f"{_vtt_timestamp(start)} --> {_vtt_timestamp(end)}")
+            lines.append(text)
+            lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def default_encoder_label(backend_name: str) -> str:
+    """What to report as the encoder when no transcode was requested.
+
+    Only Manim's own pipe is known to be x264; other backends (HyperFrames encodes
+    through its own Chrome + ffmpeg path) must not be credited with it.
+    """
+    return "x264 (manim default)" if backend_name == "manim" else f"{backend_name} default"
+
+
+def resolve_backend(name: str) -> RenderBackend:
+    """Resolve a render backend by name from ``default_backends()``.
+
+    Raises ``ValueError`` listing the available names when unknown so the CLI
+    can print a friendly message instead of a traceback (F6/F7, review focus #4).
+    """
+    backends = default_backends()
+    if name not in backends:
+        available = ", ".join(sorted(backends))
+        raise ValueError(f"unknown backend {name!r}; available: {available}")
+    return backends[name]
+
+
+def cache_variant(prov, two_stage: bool, registry, narrate: bool = False) -> str:
+    """Cache qualifier for a storyboard: provider+model, one/two-stage mode,
+    and the registry fingerprint — a model, mode, or component-schema change
+    never resumes another entry's cached storyboard."""
+    base = f"{prov.name}:{prov.model}|{'two' if two_stage else 'one'}|{registry.fingerprint()}"
+    return base + "|narr" if narrate else base  # a narrated storyboard carries `narration`; plain keys unchanged
+
+
+def make_video(
+    prompt: str | None = None,
+    storyboard_path: Path | None = None,
+    out_dir: Path | str = ".",
+    *,
+    provider: str = "auto",
+    quality: str = "standard",
+    encoder: str = "auto",
+    preview: bool = False,
+    backend: str = "manim",
+    captions: bool = True,
+    two_stage: bool = False,
+    jobs: int = 1,
+    frame_lint: bool = True,
+    vertical: bool = False,
+    theme: str | None = None,
+    narrate: bool = False,
+    voice: str | None = None,
+    debug: bool = False,
+    verify: bool = True,
+    strict: bool = False,
+    on_progress: ProgressFn | None = None,
+) -> MakeResult:
+    render_backend = resolve_backend(backend)  # fail fast: before any file write or LLM call
+    if narrate and render_backend.name != "manim":
+        raise ValueError(f"--narrate needs the manim backend (got {render_backend.name!r}): only it holds a beat for its narration")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = long_path(out_dir)
+    registry = default_registry()
+    warnings: list[str] = []
+
+    # One unit per post-processing step the user actually asked for; the render
+    # backend contributes its own scene units and fixes the total when it starts.
+    # Verify is not a post unit: it runs before the render declares its scale,
+    # and counting it here would make progress.done go backwards.
+    post_units = 1 + (1 if encoder != "auto" else 0) + (1 if frame_lint else 0) + (1 if narrate else 0)
+    progress = ProgressTracker(on_progress, post_units=post_units)
+
+    progress.announce("storyboard", "resolving storyboard")
+
+    # ---- storyboard: cache -> template -> provider ----
+    prov = None
+    cache = None
+    key = None
+    fresh_model = False  # only a fresh model answer may be sent back / degraded
+    generation_notes: list[str] = []
+    if storyboard_path is not None:
+        try:
+            sb = load_storyboard(Path(storyboard_path))
+            clamp_notes: list[str] = []
+        except ValidationError:
+            # Over-long text is fixed locally instead of failing the run.
+            from animatica.storyboard.clamp import load_storyboard_clamped  # noqa: PLC0415
+
+            sb, clamp_notes = load_storyboard_clamped(Path(storyboard_path))
+        warnings.extend(clamp_notes)
+        provider_used = "none (--from storyboard.json)"
+    else:
+        if not prompt or not str(prompt).strip():
+            raise ValueError("prompt must not be empty")
+        prompt = str(prompt).strip()
+        # Canned templates are the offline fallback. If the user explicitly chose an AI provider,
+        # they want that model's answer for *their* prompt, not a fixed example video.
+        use_templates = provider in ("auto", "template")
+        sb = TemplateMatcher().match(prompt) if use_templates else None
+        if sb is not None:
+            provider_used = "template (offline)"
+        else:
+            if provider == "template":
+                raise ValueError(
+                    "no offline template matches this prompt; pick an AI provider "
+                    "with --provider (groq/openrouter/nim/ollama) or run 'animatica setup'"
+                )
+            cfg = load_config()
+            prov = get_provider(provider, cfg)
+            if prov is None:
+                raise ValueError("no AI provider available; run 'animatica setup'")
+            provider_used = prov.name
+            cache = StoryboardCache(out_dir / ".animatica_cache")
+            key = cache.key(prompt, cache_variant(prov, two_stage, registry, narrate), "1")
+            try:
+                sb = cache.get(key)
+            except Exception:  # corrupt/stale cache entry: regenerate
+                sb = None
+            if sb is not None:
+                provider_used = f"{prov.name} (cached)"
+            else:
+                sb = (generate_storyboard_two_stage(prompt, prov, registry, narrate=narrate,
+                                                    debug=debug, out_dir=out_dir,
+                                                    notes=generation_notes) if two_stage
+                      else generate_storyboard(prompt, prov, registry, narrate=narrate,
+                                               debug=debug, out_dir=out_dir,
+                                               notes=generation_notes))
+                fresh_model = True  # cache the final storyboard only after verify/repair
+
+    if storyboard_path is None and not provider_used.startswith("template"):
+        sb, lint_notes = lint_storyboard(sb)  # model output only; never touch a hand-written --from file
+        warnings.extend(lint_notes)
+    warnings.extend(generation_notes)  # local length fixes from provider output
+
+    # Generation guidance applies to any storyboard: flag captions that
+    # describe production mechanics instead of teaching, and comparisons
+    # that lack a visual. These are notes, not errors.
+    guidance_notes = check_generation_guidance(sb)
+    warnings.extend(guidance_notes)
+
+    errors = registry.validate(sb)
+    if errors:
+        raise ValueError("invalid storyboard: " + "; ".join(errors[:6]))
+
+    # ---- compute-and-verify: fixes -> (models only) repair loop -> report ----
+    # Runs for template, --from and model-generated storyboards alike. A beat
+    # whose facts fail is unchecked, never passed. Only a fresh model answer
+    # may be sent back or degraded; --from and templates are warn-only.
+    verification: dict | None = None
+    fixes: list = []
+    if verify:
+        from animatica.verify import verify_storyboard  # noqa: PLC0415 - avoid a render-time import cycle
+
+        sent_back = 0
+        degraded: list[list[int]] = []
+        if fresh_model and prov is not None:
+            from animatica.ai.repair import repair_with_facts  # noqa: PLC0415
+
+            sb, repair_info = repair_with_facts(prompt, sb, prov, registry,
+                                                narrate=narrate, debug=debug,
+                                                out_dir=out_dir)
+            verify_result = repair_info["verify"]
+            fix_records = repair_info["fixes"]
+            sent_back = repair_info["sent_back"]
+            degraded = repair_info["degraded"]
+            repair_error = repair_info.get("repair_error", "")
+            if repair_error:
+                warnings.append(f"verify: {repair_error}")
+            warnings.extend(repair_info.get("clamps", []))
+        else:
+            # --from and template storyboards are never mechanically changed:
+            # they are verified for warnings only, and fixed == 0 in the report.
+            fix_records = []
+            verify_result = verify_storyboard(sb, registry)
+
+        for f in verify_result.findings:
+            warnings.append(
+                f"verify: scene {f.beat[0]} beat {f.beat[1]} {f.field}: {f.message}"
+            )
+        fixes = [f.as_dict() for f in fix_records]
+        verification = {
+            "checked": verify_result.checked,
+            "passed": verify_result.checked - verify_result.by_severity["error"],
+            "fixed": len(fix_records),
+            "fixes": list(fixes),
+            "sent_back": sent_back,
+            "degraded": degraded,
+            # Warns are shown in the report only (design 5.3).
+            "failed": verify_result.by_severity["error"],
+            "warned": verify_result.by_severity["warn"],
+            "unchecked": list(verify_result.unchecked),
+        }
+        if fix_records:
+            progress.announce("verify", f"Fixed {len(fix_records)} issue(s) (see report.json)")
+        if sent_back:
+            progress.announce("verify", f"Sent back {sent_back} finding(s) to the model (see report.json)")
+        if degraded:
+            progress.announce("verify", f"Degraded {len(degraded)} beat(s): narration blanked (see report.json)")
+        if verify_result.checked:
+            progress.announce("verify", (
+                f"Verified {verify_result.checked} claims, "
+                f"{verify_result.by_severity['error']} failed, "
+                f"{len(verify_result.unchecked)} unchecked (see report.json)"
+            ))
+        else:
+            progress.announce("verify", "Nothing to verify")
+
+    # The cache stores the FINAL storyboard (post-fix / post-repair / post-degrade).
+    if fresh_model and cache is not None and key is not None:
+        cache.put(key, sb)
+
+    # Apply CLI theme override if specified
+    if theme is not None:
+        sb.theme.palette = theme
+
+    _check_capabilities(sb, render_backend)
+
+    dump_storyboard(sb, out_dir / "storyboard.json")
+
+    # ---- narration (opt-in): synthesize first, so each clip's length is a beat floor ----
+    wavs = floors = None
+    narration_info: dict[str, str] | None = None
+    if narrate:
+        from animatica import narration  # noqa: PLC0415 - narration imports this module
+
+        voice = voice or narration.DEFAULT_VOICE
+        progress.announce("narration", "synthesizing narration")
+        wavs, floors = narration.narrate_for_render(sb, registry, out_dir, voice)  # fails closed, never silent
+        narration_info = {"voice": voice, "license": narration.VOICE_LICENSES.get(voice, "unknown")}
+    final_durations = _beat_durations(sb, registry, floors)
+
+    # ---- render ----
+    if preview:
+        quality = "preview"
+    render_result = render_backend.render(
+        sb,
+        out_dir,
+        RenderOptions(
+            quality=quality,
+            captions=captions,
+            jobs=jobs,
+            vertical=vertical,
+            beat_floors=floors,
+            progress=progress.backend,
+        ),
+    )
+    video = render_result.video
+    warnings.extend(render_result.warnings)
+
+    # ---- optional transcode ----
+    encoder_used = default_encoder_label(render_backend.name)
+    if encoder != "auto":
+        enc_infos = probe_encoders()
+        enc = pick_encoder(encoder, enc_infos)
+        encoder_used = enc.name
+        progress.advance("transcode", f"re-encoding with {enc.name}")
+        transcode_result = transcode(video, out_dir / "video_transcoded.mp4", enc)
+        video = transcode_result.path
+        if transcode_result.warning:
+            warnings.append(f"transcode: {transcode_result.warning}")
+
+    # ---- frame lint (non-fatal post-render quality check) ----
+    if frame_lint:
+        progress.advance("lint", "checking frames")
+        # The burned-in caption is not content. Its height depends on how the
+        # text wraps, so it is measured, not guessed.
+        lint_config = FrameLintConfig(
+            enabled=True,
+            caption_strip=_caption_strip(sb, vertical) if captions else 0.0,
+        )
+        lint_result = lint_video(
+            str(video),
+            render_result.durations,
+            lint_config,
+            beat_durations=final_durations,
+        )
+        warnings.extend(lint_result_to_warnings(lint_result))
+
+    # ---- narration track: one WAV on the final beat timing, muxed over the finished video ----
+    if narrate:
+        progress.advance("narration", "mixing narration into the video")
+        track = narration.build_track(wavs, final_durations, out_dir / "narration" / "track.wav")
+        video = narration.mux_narration(video, track, out_dir / "video_narrated.mp4")
+
+    # ---- captions + report (single writer) ----
+    progress.advance("captions", "writing captions and report")
+    _write_captions(sb, registry, out_dir / "captions.vtt", final_durations if narrate else None)
+
+    # Component fallbacks: warnings from scene.py are formatted as
+    # "{component}: {ExceptionType}: {message}" when play() raises and the
+    # beat degrades to a text card. Extract the component names so they can
+    # be recorded in report.json.
+    #
+    # Only that three-part shape counts. A component may also emit an
+    # advisory that starts with its name ("compare: text scaled to 25 px
+    # (floor 32)"); those are warnings, not fallbacks, and recording them
+    # as fallbacks would report a beat as degraded when it rendered fine.
+    registered = set(default_registry().names())
+    fallbacks: list[str] = []
+    seen_fallbacks: set[str] = set()
+    for w in render_result.warnings:
+        parts = w.split(": ", 2)
+        if len(parts) != 3:
+            continue
+        component, exc_type = parts[0], parts[1]
+        if component not in registered or component in seen_fallbacks:
+            continue
+        if not (exc_type.endswith("Error") or exc_type.endswith("Exception")):
+            continue
+        fallbacks.append(component)
+        seen_fallbacks.add(component)
+
+    write_report(
+        out_dir / "report.json",
+        render_result.stage_times,
+        warnings,
+        backend={"name": render_backend.name, "version": getattr(render_backend, "version", "unknown")},
+        scene_durations=render_result.durations,
+        fallbacks=fallbacks,
+        narration=narration_info,
+        verification=verification,
+        fixes=fixes,
+    )
+
+    if strict and verification is not None and verification["failed"]:
+        # The report is written first: --strict changes the exit code, not the
+        # evidence. Only surviving error findings block; warns are shown only.
+        from animatica.verify import VerifyStrictError  # noqa: PLC0415
+
+        raise VerifyStrictError(verify_result)  # type: ignore[possibly-undefined]
+
+    progress.finish(f"done: {video.name}")
+
+    return MakeResult(
+        video=video,
+        storyboard=out_dir / "storyboard.json",
+        captions=out_dir / "captions.vtt",
+        report=out_dir / "report.json",
+        warnings=warnings,
+        provider_used=provider_used,
+        encoder_used=encoder_used,
+        fallbacks=fallbacks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# preview_frame: extract a single frame from a rendered video
+# ---------------------------------------------------------------------------
+
+def preview_frame(
+    video_path: Path | str,
+    scene_durations: list[float],
+    scene_index: int,
+    t: float,
+    out_path: Path | str | None = None,
+) -> Path:
+    """Extract frame at time `t` within `scene_index` from `video_path`.
+
+    `scene_durations` maps scene indices to cumulative time offsets so `t`
+    (seconds within the scene) is translated to the video's absolute time.
+    Returns the path to the extracted PNG frame (writes to `out_path` if given,
+    otherwise next to the video).
+
+    Raises ValueError for invalid scene_index or t (out of range, negative,
+    non-finite). If scene_durations is empty (old report without scene
+    durations), raises ValueError with an actionable message.
+    """
+    import av
+    import numpy as np
+    from PIL import Image
+
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        raise FileNotFoundError(f"video not found: {video_path}")
+
+    # Validate scene_index and t before touching the video
+    if not isinstance(scene_index, int) or scene_index < 0:
+        raise ValueError(f"scene_index must be a non-negative integer, got {scene_index!r}")
+    if not isinstance(t, (int, float)) or isinstance(t, bool):
+        raise ValueError(f"t must be a number, got {t!r}")
+    if not np.isfinite(float(t)):
+        raise ValueError(f"t must be finite, got {t!r}")
+    if not scene_durations:
+        raise ValueError(
+            f"no scene durations available for {video_path}: report.json has no "
+            f"`scene_durations` field. Re-render the storyboard or specify "
+            f"`scene_durations` as a list of per-scene seconds."
+        )
+    if scene_index >= len(scene_durations):
+        raise ValueError(
+            f"scene_index {scene_index} out of range for {len(scene_durations)} scenes: "
+            f"scene_durations={scene_durations}"
+        )
+    if t < 0:
+        raise ValueError(f"t must be >= 0, got {t!r}")
+    if t > scene_durations[scene_index]:
+        raise ValueError(
+            f"t={t} is beyond scene {scene_index} duration "
+            f"{scene_durations[scene_index]}s"
+        )
+
+    # Cumulative offsets: scene 0 starts at 0, scene 1 at sum(scene 0), etc.
+    offset = sum(scene_durations[:scene_index])
+    abs_ts = offset + t
+
+    container = av.open(str(video_path))
+    try:
+        video_stream = next(s for s in container.streams if s.type == "video")
+        target_frame = None
+        for frame in container.decode(video_stream):
+            ts = float(frame.time) if frame.time is not None else 0.0
+            if ts >= abs_ts:
+                target_frame = frame
+                break
+        if target_frame is None:
+            raise ValueError(f"no frame at or after t={abs_ts:.1f}s in {video_path}")
+        img = Image.fromarray(target_frame.to_ndarray(format="rgb24"))
+    finally:
+        container.close()
+
+    if out_path is None:
+        out_path = video_path.with_suffix(f".scene{scene_index}.t{t:.1f}.png")
+    out_path = Path(out_path)
+    img.save(out_path)
+    return out_path
+
+
+def _check_capabilities(sb: Storyboard, backend: RenderBackend, registry: ComponentRegistry | None = None) -> None:
+    """Check that every component's required capabilities are supported by the backend.
+
+    Raises ``ValueError`` with an actionable message when a component requires
+    a capability the backend does not support. Checked before any rendering
+    work begins so failures are fast and clear.
+
+    Fail-closed: a backend that declares no capabilities supports nothing.
+    Components with no required capabilities are compatible with any backend.
+    """
+    cap_fn = getattr(backend, "capabilities", None)
+    supported = set(cap_fn()) if callable(cap_fn) else set(getattr(backend, "supported_capabilities", []))
+    missing: list[str] = []
+    for si, scene in enumerate(sb.scenes, 1):
+        for bi, beat in enumerate(scene.beats, 1):
+            # Look up component class from registry to get required_capabilities
+            reg = registry or default_registry()
+            try:
+                comp_cls = reg.get(beat.component).__class__
+            except KeyError:
+                continue  # unknown component: validation already caught this
+            for cap in getattr(comp_cls, "required_capabilities", []):
+                if cap not in supported:
+                    missing.append(
+                        f"scene {si}, beat {bi}: component '{beat.component}' requires "
+                        f"capability '{cap}' but backend '{backend.name}' only supports: "
+                        f"{', '.join(sorted(supported)) or '(none)'}"
+                    )
+    if missing:
+        raise ValueError(
+            "Capability incompatibility: storyboard requires capabilities the backend does not support.\n"
+            + "\n".join(f"  - {m}" for m in missing)
+        )
+

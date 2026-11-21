@@ -1,0 +1,28 @@
+make a title card about renewable energy
+explain the pythagorean theorem a^2 + b^2 = c^2
+steps to bake a cake
+explain taylor series
+bar chart of sales by quarter
+morph a circle into a square
+diagram with nodes A B C and edges from A to B and B to C
+flow diagram from water to steam to turbine
+code highlight the main function
+explain this python function line by line
+compare mitosis and meiosis side by side
+timeline of the history of computers
+array visualization of the values 5 3 8 1 with a binary search for 8
+show the recursion call tree of fib(5)
+table of planets with diameter and mass
+number line from 0 to 20 with jumps at 0 7 15
+matrix of the 3x3 identity matrix
+stat callout that 42 percent of students borrowed a book
+derive the quadratic formula step by step
+parametric graph of a circle with x equals cos of t and y equals sin of t
+show the fibonacci series with a ball bouncing on terms 0 to 10
+probability tree for two coin flips with the chance of each outcome
+venn diagram of even numbers and primes
+pie chart of browser market share
+code diff of replacing 3.14 with math.pi in an area function
+breadth-first search traversal of a small graph
+unit circle with the sine and cosine of the special angles
+explain the Fourier transform with two sine waves

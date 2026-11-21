@@ -1,0 +1,84 @@
+---
+name: animatica
+description: Use when asked to make or fix an explainer video with Animatica, add a component, or repair a storyboard.json (validate, lint, render, inspect frames).
+version: 1.0.0
+---
+# Animatica skill — build explainer-video components as an agent
+
+## When to Use
+- Making or fixing an explainer video: writing a `storyboard.json`, validating, linting, rendering, checking frames.
+- Adding or fixing an Animatica component (needs a checkout of the animatica-manim repo).
+
+Everything under "For component development" refers to files in that checkout (`docs/`, `src/`, `tests/`). If the skill was installed from the hub and no checkout exists, use only the storyboard loop and the tools below.
+
+## The loop (never skip validation)
+
+### For component development
+1. **Read first**: `docs/COMPONENTS.md`, `docs/ROADMAP.md`, `docs/SESSION_TASKS.md`, and the pattern file `src/animatica/components/bounce_sequence.py`.
+2. **Scaffold** (if new component): `animatica new-component <snake_name>` — fills module, registry, docs, test, conformance JSON. You only fill the TODOs.
+3. **Implement**: `Params` (pydantic, with limits + validators), `duration()` (pure function of params), `play()` (draw/animate; raising degrades to `fallback_text()` + warning, never abort the video), `fallback_text()`.
+4. **Validate**: `pytest -q` must pass. Add/extend `tests/test_<name>.py` and `tests/conformance/<name>.json` + `expected.json`.
+5. **Render check** (on a machine with manim): `animatica make --from tests/conformance/<name>.json -o /tmp/<name> --quality preview` — must print no Warning.
+6. **Log**: append date + result to `docs/SESSION_TASKS.md`.
+
+### For storyboard-driven video creation (agent loop)
+1. **Outline**: Ask the model for a scene list (component + intent per beat) via `build_outline_prompt`.
+2. **Validate**: `animatica validate storyboard.json` — must return empty errors.
+3. **Lint**: `animatica lint storyboard.json` (MCP: `lint_storyboard`) — review notes, fix narrative-order issues.
+4. **Render**: `animatica make --from storyboard.json -o out/` — verify video plays.
+5. **Preview frame**: `animatica mcp` tool `preview_frame` — inspect a frame at time t to verify visual quality.
+6. **Fix**: Edit storyboard.json directly or via `animatica edit out/ "instruction"`, then re-render.
+
+## Pitfalls
+- `render_storyboard` is slow. Validate and lint first, render with `preview` before a full-quality render.
+- A malformed storyboard comes back as a `load error:` entry from `validate_storyboard`, not as a failed call: read `errors`, fix the JSON, validate again.
+- `preview_frame` needs the `report.json` the render wrote next to the video; `scene_index` is 0-based.
+- `--narrate` needs the manim backend and Piper; on a missing Piper it fails closed rather than rendering silent.
+- Do not write Manim code to get around a component limit. Pick another component or split the beat.
+
+## Verification
+- `validate_storyboard` returns `valid: true` with no errors.
+- `render_storyboard` returns a `video` path and an empty or understood `warnings` list.
+- `preview_frame` on at least one early and one late scene shows what the storyboard says.
+
+## Hard rules
+- One task card at a time (see `docs/TASKS_FOR_HERMES.md`). Do NOT touch files not listed on the card.
+- Never write Manim code at `animatica make` time; model/agent-written component code is dev-time only, reviewed, gated by tests.
+- Storyboard JSON v1 is the contract: max 12 scenes, 8 beats/scene, 300 chars per text field. One `bounce_sequence` = one scene, never split.
+- Keep `docs/COMPONENTS.md` in sync — a test compares it against the registry.
+- If an acceptance command fails twice, stop and write what failed at the bottom of `docs/SESSION_TASKS.md`.
+
+## Agent JSON tools (no MCP server needed)
+- `animatica list-components` — JSON list of component names
+- `animatica component-schema <name>` — JSON params schema
+- `animatica validate storyboard.json` — JSON list of errors (empty = valid)
+- `animatica lint storyboard.json` — JSON {storyboard, notes} after deterministic lint
+
+## Agent JSON-CLI (MCP mode)
+`animatica mcp` runs a real Model Context Protocol server on stdio
+(JSON-RPC 2.0). Hermes (or any MCP client) connects via stdio:
+
+Tools:
+- `list_components` — list registered component names
+- `component_schema {name}` — JSON params schema for a component
+- `validate_storyboard {path}` — returns `{valid, errors}`; a malformed file comes back as a `load error:` entry, not a crash
+- `lint_storyboard {path}` — returns `{storyboard, notes}` (deterministic, no render)
+- `render_storyboard {path, out_dir?, preview?, narrate?, voice?}` — render to video (slow; use `preview` first)
+- `preview_frame {video, scene_index, t, out?}` — extract a frame PNG (`scene_index` is 0-based)
+- `lint_video {video, scene_durations?}` — frame-level quality checks
+
+Example MCP session (stdio):
+```
+--> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}
+<--  {"jsonrpc":"2.0","id":1,"result":{"capabilities":{...},"serverInfo":{"name":"animatica"}}}
+--> {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+<--  {"jsonrpc":"2.0","id":2,"result":{"tools":[...]}}
+--> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_components","arguments":{}}}
+<--  {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"..."}]}}
+```
+
+## Commands
+- `animatica make "prompt" -o out/ [--provider X --model Y --preview]` — full video
+- `animatica make --from storyboard.json -o out/` — re-render without any LLM
+- `animatica edit out/ "instruction"` — AI-assisted storyboard edit + re-render
+- `animatica doctor` / `animatica setup` / `animatica guide` / `animatica bootstrap` / `animatica eval`

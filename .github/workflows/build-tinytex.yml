@@ -1,0 +1,33 @@
+name: build-tinytex-artifact
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # required to attach the zip to the release
+
+jobs:
+  tinytex:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install TinyTeX
+        run: curl -fsSL https://yihui.org/tinytex/install-unx.sh | sh
+      - name: Locate tlmgr (path varies by installer version)
+        id: tlmgr
+        run: |
+          TLMGR=$(find "$HOME" -name tlmgr -path "*/bin/*" 2>/dev/null | head -1)
+          if [ -z "$TLMGR" ]; then echo "tlmgr not found" >&2; exit 1; fi
+          echo "path=$TLMGR" >> "$GITHUB_OUTPUT"
+      - name: Install exactly the packages Manim needs
+        run: ${{ steps.tlmgr.outputs.path }} install standalone preview babel-english amsmath amsfonts dvisvgm varwidth
+      - name: Bake artifact
+        run: |
+          TEXDIR=$(dirname "$(dirname "$(dirname "${{ steps.tlmgr.outputs.path }}")")")
+          cd "$TEXDIR" && zip -qr "$GITHUB_WORKSPACE/tinytex-manim.zip" .
+      - name: Upload to release (release events only; manual runs just build the zip)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tinytex-manim.zip

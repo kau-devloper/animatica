@@ -1,0 +1,13 @@
+[groq]
+model = "openai/gpt-oss-20b"
+
+[openrouter]
+model = "nvidia/nemotron-3.5-super-vl:free"
+allow_paid = false
+
+[nim]
+model = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+
+[ollama]
+model = "llama3.1"
+
